@@ -1,0 +1,338 @@
+import json
+import msvcrt
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+
+import codex_browser_patch as patch
+
+
+KEY = "0123456789abcdef"
+ANCHOR = "new eh(r,this.clientApi,()=>je(this.runtime),this.turnEndedTracker,sv)"
+
+
+def descriptor(root, key=KEY):
+    base = root / key
+    node = base / "bin/node.exe"
+    return {"mcpServers": {"cua_repl": {
+        "command": str(node),
+        "args": [str(base / patch.ENTRY)],
+        "env": {
+            "NODE_REPL_NODE_PATH": str(node),
+            "CUA_REPL_NODE_REPL_PATH": str(base / "bin/node_repl.exe"),
+            "NODE_REPL_TRUSTED_SERVICES": json.dumps(
+                {"browser": "@oai/browser-desktop/service"}),
+            "CUA_REPL_ENABLED_SURFACES": "browser",
+        },
+    }}}
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="browser-patch-test-")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.home = root / "home"
+        self.runtime_root = root / "runtime"
+        self.state = root / "state"
+        self.runtime = self.runtime_root / KEY
+        self.service = self.runtime / patch.SERVICE
+        self.original = ("prefix;" + ANCHOR + ";suffix").encode()
+        files = {
+            "manifest.json": b"fixture-manifest",
+            "bin/node.exe": b"fixture-node",
+            "bin/node_repl.exe": b"fixture-worker",
+            patch.ENTRY: b"fixture-entry",
+            patch.SERVICE: self.original,
+        }
+        for name, contents in files.items():
+            target = self.runtime / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents)
+        self.descriptor_dir = self.home / "plugins/cache/openai-bundled/unified-computer-use/test"
+        self.descriptor_dir.mkdir(parents=True)
+        (self.descriptor_dir / ".mcp.json").write_text(
+            json.dumps(descriptor(self.runtime_root)), encoding="utf-8")
+        self.contract = {
+            "version": "fixture",
+            "service": patch.sha(self.original),
+            "worker": patch.sha(files["bin/node_repl.exe"]),
+            "node": patch.sha(files["bin/node.exe"]),
+            "anchor": ANCHOR,
+            "binding": "new eh(r,this.clientApi,()=>je(this.runtime),this.turnEndedTracker,"
+                       "cppNativeIdentificationReader(this.runtime,sv,je,{path}))",
+        }
+        self.pins = mock.patch.multiple(
+            patch, CONTRACTS={patch.sha(files["manifest.json"]): self.contract},
+            ENTRY_SHA=patch.sha(files[patch.ENTRY]))
+        self.pins.start()
+        self.addCleanup(self.pins.stop)
+        self.selection = (KEY, str(self.home))
+
+    def test_status_is_read_only_and_roundtrip_is_idempotent(self):
+        patch.status(self.runtime_root, self.state, self.selection)
+        self.assertFalse(self.state.exists())
+        before_mtime = self.service.stat().st_mtime_ns
+        patch.apply(self.runtime_root, self.state, self.selection)
+        modified = self.service.read_bytes()
+        self.assertEqual(modified, patch.transform(self.original, self.contract,
+                                                   self.state / "control.json"))
+        self.assertEqual(self.original,
+                         (self.state / KEY / "original.mjs").read_bytes())
+        self.assertTrue(json.loads((self.state / "control.json").read_text())
+                        ["requireIdentification"])
+        patch.apply(self.runtime_root, self.state, self.selection)
+        self.assertEqual(modified, self.service.read_bytes())
+        patch.restore(self.runtime_root, self.state)
+        self.assertEqual(self.original, self.service.read_bytes())
+        self.assertEqual(before_mtime, self.service.stat().st_mtime_ns)
+        self.assertFalse(json.loads((self.state / "control.json").read_text())
+                         ["requireIdentification"])
+        patch.restore(self.runtime_root, self.state)
+        patch.apply(self.runtime_root, self.state, self.selection)
+        patch.restore(self.runtime_root, self.state)
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_unknown_component_never_writes(self):
+        (self.runtime / "bin/node_repl.exe").write_bytes(b"changed")
+        with self.assertRaises(patch.Refused):
+            patch.apply(self.runtime_root, self.state, self.selection)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_component_drift_disables_previously_enabled_control(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        candidate = self.service.read_bytes()
+        (self.runtime / "bin/node_repl.exe").write_bytes(b"replaced worker")
+        with self.assertRaises(patch.Refused):
+            patch.apply(self.runtime_root, self.state, self.selection)
+        self.assertEqual(candidate, self.service.read_bytes())
+        self.assertFalse(json.loads((self.state / "control.json").read_text())
+                         ["requireIdentification"])
+
+    def test_unknown_or_other_adapter_is_refused(self):
+        self.service.write_bytes(self.original + b"// external patch")
+        with self.assertRaises(patch.Refused):
+            patch.apply(self.runtime_root, self.state, self.selection)
+        self.assertEqual(self.original + b"// external patch", self.service.read_bytes())
+        self.assertFalse(self.state.exists())
+
+    def test_external_change_blocks_restore_and_disables_control(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        self.service.write_bytes(b"external edit")
+        with self.assertRaises(patch.Refused):
+            patch.restore(self.runtime_root, self.state)
+        self.assertEqual(b"external edit", self.service.read_bytes())
+        self.assertFalse(json.loads((self.state / "control.json").read_text())
+                         ["requireIdentification"])
+        self.assertEqual(self.original, (self.state / KEY / "original.mjs").read_bytes())
+
+    def test_tampered_backup_blocks_restoration(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        candidate = self.service.read_bytes()
+        (self.state / KEY / "original.mjs").write_bytes(b"bad backup")
+        with self.assertRaises(patch.Refused):
+            patch.restore(self.runtime_root, self.state)
+        self.assertEqual(candidate, self.service.read_bytes())
+
+    def test_ambiguous_descriptors_and_path_escape(self):
+        data = descriptor(self.runtime_root)
+        data["mcpServers"]["cua_repl"]["command"] = str(
+            self.runtime_root / KEY / "bin/../bin/node.exe")
+        with self.assertRaises(patch.Refused):
+            patch.descriptor_key(data, self.runtime_root)
+        other = self.descriptor_dir.parent / "other"
+        other.mkdir()
+        (other / ".mcp.json").write_text(
+            json.dumps(descriptor(self.runtime_root, "fedcba9876543210")), encoding="utf-8")
+        with self.assertRaises(patch.Refused):
+            patch.discover(self.home, self.runtime_root)
+        self.assertFalse(self.state.exists())
+
+    def test_removed_runtime_is_not_recreated(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        self.service.unlink()
+        patch.restore(self.runtime_root, self.state)
+        self.assertFalse(self.service.exists())
+
+    def test_recovery_can_live_on_another_drive_but_not_in_cache(self):
+        self.assertTrue(patch.outside_runtime(Path("C:/cache"), Path("D:/backups")))
+        self.assertFalse(patch.outside_runtime(Path("C:/cache"), Path("C:/cache/backups")))
+        self.assertFalse(patch.outside_runtime(Path("C:/cache"), Path("C:/cache")))
+        self.assertTrue(patch.outside_runtime(Path("C:/cache"), Path("C:/other")))
+        cpp_state = Path.home() / ".codex-session-delete/native-browser-identification"
+        with self.assertRaises(patch.Refused):
+            patch.validate_locations(self.runtime_root, cpp_state)
+        with self.assertRaises(patch.Refused):
+            patch.validate_locations(self.runtime_root, cpp_state / "nested")
+
+    def test_wrong_recovery_root_or_missing_journal_is_not_reported_as_restored(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        candidate = self.service.read_bytes()
+        wrong = self.state.parent / "wrong-state"
+        with self.assertRaises(patch.Refused):
+            patch.restore(self.runtime_root, wrong)
+        self.assertFalse(wrong.exists())
+        self.assertEqual(candidate, self.service.read_bytes())
+        (self.state / KEY / "journal.json").unlink()
+        with self.assertRaises(patch.Refused):
+            patch.restore(self.runtime_root, self.state)
+        self.assertEqual(candidate, self.service.read_bytes())
+        self.assertFalse(json.loads((self.state / "control.json").read_text())
+                         ["requireIdentification"])
+
+    def test_foreign_recovery_directory_is_not_claimed(self):
+        self.state.mkdir()
+        (self.state / "foreign.txt").write_text("do not touch", encoding="utf-8")
+        with self.assertRaises(patch.Refused):
+            patch.apply(self.runtime_root, self.state, self.selection)
+        self.assertEqual(["foreign.txt"], [item.name for item in self.state.iterdir()])
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_live_process_guard_refuses_running_app(self):
+        actual_root = Path(os.environ["LOCALAPPDATA"]) / "OpenAI/Codex/runtimes/cua_node"
+        result = subprocess.CompletedProcess(
+            ["tasklist.exe"], 0, '"ChatGPT.exe","123","Console","1","100 K"\n')
+        with mock.patch.object(patch.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(patch.Refused, "chatgpt.exe"):
+                patch.require_offline(actual_root)
+        with mock.patch.object(patch.subprocess, "run",
+                               side_effect=FileNotFoundError("tasklist")):
+            with self.assertRaises(patch.Refused):
+                patch.require_offline(actual_root)
+
+    def test_missing_owner_marker_can_recover_from_verified_journal(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        (self.state / "owner.json").unlink()
+        patch.restore(self.runtime_root, self.state)
+        self.assertEqual(self.original, self.service.read_bytes())
+        self.assertTrue(patch.owns_state(self.state))
+        self.assertFalse(json.loads((self.state / "control.json").read_text())
+                         ["requireIdentification"])
+
+    def test_corrupt_owner_or_missing_journal_disables_recognizable_control(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        candidate = self.service.read_bytes()
+        (self.state / "owner.json").write_bytes(b"wrong owner")
+        with self.assertRaises(patch.Refused):
+            patch.restore(self.runtime_root, self.state)
+        self.assertEqual(candidate, self.service.read_bytes())
+        self.assertFalse(json.loads((self.state / "control.json").read_text())
+                         ["requireIdentification"])
+        (self.state / "owner.json").unlink()
+        (self.state / KEY / "journal.json").unlink()
+        (self.state / "control.json").write_bytes(patch.control_bytes(True))
+        with self.assertRaises(patch.Refused):
+            patch.restore(self.runtime_root, self.state)
+        self.assertFalse(json.loads((self.state / "control.json").read_text())
+                         ["requireIdentification"])
+
+    def test_codexpp_monitor_and_existing_journal_are_refused(self):
+        fake_home = Path(self.temp.name) / "fake-user"
+        cpp_root = fake_home / ".codex-session-delete/native-browser-identification"
+        cpp_root.mkdir(parents=True)
+        local = Path(os.environ["LOCALAPPDATA"])
+        actual_root = local / "OpenAI/Codex/runtimes/cua_node"
+        with mock.patch.object(patch.Path, "home", return_value=fake_home):
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local)}):
+                with self.assertRaisesRegex(patch.Refused, "Codex\\+\\+ native browser state"):
+                    with patch.codexpp_guard(actual_root, KEY):
+                        pass
+                with self.assertRaises(patch.Refused):
+                    patch.require_no_codexpp_state(actual_root)
+                with (cpp_root / "monitor.lock").open("w+b") as stream:
+                    stream.write(b"x")
+                    stream.flush()
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    try:
+                        with self.assertRaises(patch.Refused):
+                            with patch.codexpp_guard(actual_root, KEY):
+                                pass
+                    finally:
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                journal = cpp_root / KEY / "journal.json"
+                journal.parent.mkdir()
+                journal.write_text("{}", encoding="utf-8")
+                with self.assertRaises(patch.Refused):
+                    with patch.codexpp_guard(actual_root, KEY):
+                        pass
+
+    def test_legacy_binding_roundtrip(self):
+        anchor = "new nf(r,this.clientApi,()=>ze(this.runtime),this.turnEndedTracker,cD)"
+        self.original = ("prefix;" + anchor + ";suffix").encode()
+        self.service.write_bytes(self.original)
+        self.contract.update({
+            "version": "fixture-legacy",
+            "service": patch.sha(self.original),
+            "anchor": anchor,
+            "binding": "new nf(r,this.clientApi,()=>ze(this.runtime),this.turnEndedTracker,"
+                       "cppNativeIdentificationReader(this.runtime,cD,ze,{path}))",
+        })
+        patch.apply(self.runtime_root, self.state, self.selection)
+        self.assertIn(b"cppNativeIdentificationReader(this.runtime,cD,ze,",
+                      self.service.read_bytes())
+        patch.restore(self.runtime_root, self.state)
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_restore_preflights_all_caches(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        first_candidate = self.service.read_bytes()
+        other_key = "fedcba9876543210"
+        other_service = self.runtime_root / other_key / patch.SERVICE
+        other_service.parent.mkdir(parents=True)
+        other_service.write_bytes(b"external edit")
+        shutil.copytree(self.state / KEY, self.state / other_key)
+        with self.assertRaises(patch.Refused):
+            patch.restore(self.runtime_root, self.state)
+        self.assertEqual(first_candidate, self.service.read_bytes())
+        self.assertEqual(b"external edit", other_service.read_bytes())
+
+
+@unittest.skipUnless(os.environ.get("CODEX_BROWSER_FIXTURE_RUNTIME") and
+                     os.environ.get("CODEX_BROWSER_FIXTURE_DESCRIPTOR"),
+                     "Set both pinned native fixture paths to run the genuine-byte test")
+class GenuineNativeFixture(unittest.TestCase):
+    def test_pinned_runtime_copy_roundtrip(self):
+        runtime = Path(os.environ["CODEX_BROWSER_FIXTURE_RUNTIME"])
+        original_descriptor = Path(os.environ["CODEX_BROWSER_FIXTURE_DESCRIPTOR"])
+        original_service = Path(os.environ.get("CODEX_BROWSER_FIXTURE_SERVICE",
+                                               str(runtime / patch.SERVICE)))
+        original = json.loads(patch.read_regular(original_descriptor, 1024 * 1024))
+        original_root = runtime.parent
+        self.assertEqual(runtime.name, patch.descriptor_key(original, original_root))
+        test_temp = os.environ.get("CODEX_BROWSER_TEST_TEMP")
+        with tempfile.TemporaryDirectory(prefix="browser-patch-real-", dir=test_temp) as temp:
+            root = Path(temp)
+            runtime_root = root / "runtime"
+            copied = runtime_root / runtime.name
+            home = root / "home"
+            state = root / "state"
+            for relative in ("manifest.json", "bin/node.exe", "bin/node_repl.exe",
+                             patch.ENTRY, patch.SERVICE):
+                dest = copied / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(original_service if relative == patch.SERVICE
+                             else runtime / relative, dest)
+            cache = home / "plugins/cache/openai-bundled/unified-computer-use/test"
+            cache.mkdir(parents=True)
+            (cache / ".mcp.json").write_text(
+                json.dumps(descriptor(runtime_root, runtime.name)), encoding="utf-8")
+            selection = patch.find_runtime([home], runtime_root)
+            self.assertEqual(selection[0], runtime.name)
+            before = (copied / patch.SERVICE).read_bytes()
+            before_mtime = (copied / patch.SERVICE).stat().st_mtime_ns
+            patch.apply(runtime_root, state, selection)
+            self.assertNotEqual(before, (copied / patch.SERVICE).read_bytes())
+            patch.restore(runtime_root, state)
+            self.assertEqual(before, (copied / patch.SERVICE).read_bytes())
+            self.assertEqual(before_mtime, (copied / patch.SERVICE).stat().st_mtime_ns)
+
+
+if __name__ == "__main__":
+    unittest.main()
