@@ -4,6 +4,7 @@
 import argparse
 from contextlib import contextmanager
 import csv
+from dataclasses import dataclass
 import hashlib
 import json
 import msvcrt
@@ -50,6 +51,18 @@ CONTRACTS = {
 
 class Refused(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class PatchStatus:
+    code: str
+    detail: str
+    version: str = ""
+    home: str = ""
+    service: str = ""
+    can_apply: bool = False
+    can_restore: bool = False
+    recovery_count: int = 0
 
 
 def require(condition, message):
@@ -541,29 +554,106 @@ def restore(runtime_root, state_root):
     print("The browser extension may retain request identification until changed in the extension.")
 
 
+def inspect_status(runtime_root, state_root, selection):
+    """Read-only disk diagnosis; action flags are hints, never a substitute for write guards."""
+    validate_locations(runtime_root, state_root)
+    keys = records(state_root)
+    owned = state_root.exists() and owns_state(state_root)
+    marker = state_root / "owner.json"
+    recoverable = bool(keys) and (
+        owned or (not marker.exists() and recoverable_without_owner(state_root)))
+    conflict = (bool(keys) and not recoverable or
+                state_root.exists() and not owned and
+                (marker.exists() or any(state_root.iterdir())) and not recoverable)
+    version = ""
+    home = selection[1] if selection else ""
+    service = ""
+    code = "missing"
+    detail = "No generated CUA browser descriptor found. Start Codex once, then refresh."
+    can_apply = False
+    if selection:
+        key, _ = selection
+        target = runtime_root / key / SERVICE
+        service = str(target)
+        try:
+            contract = select_contract(runtime_root / key)
+            version = contract["version"]
+            current = read_regular(target, MAX_SERVICE)
+            if sha(current) == contract["service"]:
+                code = "original"
+                detail = "Supported original service. Ready to apply after Codex is closed."
+                can_apply = True
+            elif owned and key in keys:
+                _, _, candidate = recovery(state_root, key)
+                if current == candidate:
+                    control = json.loads(read_regular(state_root / "control.json", 1024))
+                    require(set(control) == {"schema", "requireIdentification"} and
+                            control["schema"] == 1 and
+                            type(control["requireIdentification"]) is bool,
+                            "Invalid local control state")
+                    code = "patched" if control["requireIdentification"] else "disabled"
+                    detail = ("Patch present on disk; browser connectivity has not been tested."
+                              if code == "patched" else
+                              "Patch present, but local request identification is disabled.")
+                    can_apply = code == "disabled"
+                else:
+                    code = "conflict"
+                    detail = "Browser service has changed outside this tool."
+            else:
+                code = "conflict"
+                detail = "Browser service was changed by another tool or has an unknown fingerprint."
+        except (Refused, OSError, ValueError, UnicodeError) as exc:
+            code = "unsupported"
+            detail = str(exc)
+    if conflict:
+        code = "conflict"
+        detail = "Recovery ownership or journal cannot be verified."
+        can_apply = False
+    elif recoverable:
+        for old_key in keys:
+            try:
+                recovery(state_root, old_key)
+            except (Refused, OSError, ValueError, UnicodeError) as exc:
+                code, detail, conflict = "conflict", str(exc), True
+                can_apply = False
+                break
+    can_restore = recoverable and not conflict
+    if not conflict:
+        try:
+            refuse_orphaned_services(runtime_root, set(keys))
+        except (Refused, OSError, ValueError, UnicodeError) as exc:
+            code, detail, can_apply = "conflict", str(exc), False
+            can_restore = False
+    local = os.environ.get("LOCALAPPDATA")
+    if (code == "conflict" and not keys and local and
+            same_path(runtime_root, Path(local) / "OpenAI/Codex/runtimes/cua_node") and
+            (Path.home() / ".codex-session-delete/native-browser-identification").exists()):
+        detail += " Codex++ native browser state also exists; use its built-in option."
+    if can_apply:
+        try:
+            require_no_codexpp_state(runtime_root)
+        except (Refused, OSError) as exc:
+            code, detail, can_apply = "conflict", str(exc), False
+    if can_apply or can_restore:
+        try:
+            require_offline(runtime_root)
+        except (Refused, OSError) as exc:
+            detail = str(exc)
+            code = "running"
+            can_apply = can_restore = False
+    return PatchStatus(code, detail, version, home, service,
+                       can_apply, can_restore, len(keys))
+
+
 def status(runtime_root, state_root, selection):
     print("CUA runtime root: " + str(runtime_root))
     print("Recovery root: " + str(state_root))
-    if selection is None:
-        print("No generated browser descriptor found.")
-    else:
-        key, home = selection
-        print("Selected by " + home + ": " + key)
-        runtime = runtime_root / key
-        try:
-            contract = select_contract(runtime)
-            current = read_regular(runtime / SERVICE, MAX_SERVICE)
-            if sha(current) == contract["service"]:
-                state = "original"
-            elif owns_state(state_root) and key in records(state_root):
-                _, _, candidate = recovery(state_root, key)
-                state = "patched by this tool" if current == candidate else "unknown modification"
-            else:
-                state = ("another adapter or unknown modification"
-                         if b"cppNativeIdentificationReader" in current else "unknown modification")
-            print("Fingerprint: " + contract["version"] + "; browser service: " + state)
-        except (Refused, OSError, ValueError) as exc:
-            print("Unsupported or incomplete runtime: " + str(exc))
+    snapshot = inspect_status(runtime_root, state_root, selection)
+    if selection:
+        print("Selected by " + snapshot.home + ": " + selection[0])
+    print("Patch status: " + snapshot.code + "; " + snapshot.detail)
+    if snapshot.version:
+        print("CUA fingerprint: " + snapshot.version)
     for key in records(state_root):
         print("Retained recovery: " + key)
 

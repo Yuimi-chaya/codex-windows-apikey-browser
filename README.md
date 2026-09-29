@@ -2,7 +2,7 @@
 
 **中文** | [English](#english)
 
-这是一个独立于 Codex++ 的 Windows 脚本，用于修复特定版本 Codex Desktop / CUA 经 `mcp__cua_repl` 在纯 API key 登录下首次调用 Edge / Chrome 浏览器时出现的 `unsupported Codex auth method: apikey`。它把 Codex++ [PR #2335](https://github.com/BigPizzaV3/CodexPlusPlus/pull/2335) 中经过异机用户测试的浏览器标识回调适配提取成可独立运行、可还原的最小补丁。它不是官方工具，也不保证修复 [issue #2294](https://github.com/BigPizzaV3/CodexPlusPlus/issues/2294) 中所有浏览器故障。
+这是一个独立于 Codex++ 的 Windows 工具，用于修复特定版本 Codex Desktop / CUA 经 `mcp__cua_repl` 在纯 API key 登录下首次调用 Edge / Chrome 浏览器时出现的 `unsupported Codex auth method: apikey`。它把 Codex++ [PR #2335](https://github.com/BigPizzaV3/CodexPlusPlus/pull/2335) 中经过异机用户测试的浏览器标识回调适配提取成可独立运行、可还原的最小补丁。它不是官方工具，也不保证修复 [issue #2294](https://github.com/BigPizzaV3/CodexPlusPlus/issues/2294) 中所有浏览器故障。
 
 ## 作用与范围
 
@@ -14,7 +14,15 @@
 
 ## 使用
 
-需要 Windows 和 Python 3.10+，只使用标准库，不需要管理员权限或 pip 包。先保存工作并**正常退出 Codex App 与 Codex++**；脚本会在修改实际缓存前检查是否仍有 Codex/Codex++/CUA 进程，并拒绝在检测到运行中的进程时操作。它不能禁止另一人或另一进程**随后**启动应用，故请保持应用退出直到命令结束。**不要与 Codex++ 的“原生 Edge / Chrome 请求标识兼容”选项并用**：只要存在 Codex++ 的原生浏览器适配状态目录，`apply` 就会拒绝；此前使用过该选项的用户应使用 Codex++ 内建功能。在重新启用 Codex++ 原生补丁之前，应先运行本脚本 `restore`。首次使用前先启动过 Codex，使其生成 `unified-computer-use` 的 `.mcp.json`，再退出。
+需要 Windows；EXE 版无需安装 Python，源码脚本需要 Python 3.10+，只使用标准库。无需管理员权限。先保存工作并**正常退出 Codex App 与 Codex++**；工具会在修改实际缓存前检查是否仍有 Codex/Codex++/CUA 进程，并拒绝在检测到运行中的进程时操作。它不能禁止另一人或另一进程**随后**启动应用，故请保持应用退出直到操作结束。**不要与 Codex++ 的“原生 Edge / Chrome 请求标识兼容”选项并用**：只要存在 Codex++ 的原生浏览器适配状态目录，`apply` 就会拒绝；此前使用过该选项的用户应使用 Codex++ 内建功能。在重新启用 Codex++ 原生补丁之前，应先用本工具还原。首次使用前先启动过 Codex，使其生成 `unified-computer-use` 的 `.mcp.json`，再退出。
+
+### 图形界面
+
+从 [Releases](https://github.com/Yuimi-chaya/codex-windows-apikey-browser/releases) 下载 Windows EXE，核对发布页的 SHA-256 后运行。界面自动读取当前用户注册的 Codex App 版本与安装路径，并通过 Codex 数据目录中的插件描述文件定位实际 CUA 服务。**安装路径仅供识别；补丁修改的是界面显示的“实际补丁文件”，而不是安装包。**“选择 Codex 路径”用于选择包含插件缓存的 `.codex` **数据目录**，不接受 App 安装目录。未签名的 EXE 可能触发 Windows 安全警告；请从本仓库发布页取得文件并核对哈希。
+
+状态检查只读。退出 Codex / Codex++ 后，点击“解锁浏览器”，重新打开 Codex，并在新的浏览器工具上下文中测试。需要撤销时，再次退出应用并点击“还原”。状态“已解锁（磁盘状态）”只表明文件与本工具的恢复记录一致，**不是**浏览器连接成功的证明。若遇到未知指纹、其他工具修改、恢复资料冲突或运行进程，按钮会禁用或操作被再次核验后拒绝；不要直接替换文件或删除恢复资料。
+
+### 命令行
 
 在本仓库目录打开 PowerShell：
 
@@ -49,17 +57,23 @@ py -3 -m unittest discover -s tests -v
 
 核心回调与辅助函数提取自 [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 Windows 原生浏览器兼容实现，沿用 GNU AGPL-3.0；详见 [LICENSE](LICENSE)。本仓库与 OpenAI 没有关联或背书。
 
+构建 EXE 需要在单独虚拟环境安装 `requirements-build.txt` 中固定版本的 PyInstaller。`build.ps1 -WorkRoot <独立工作目录>` 把虚拟环境、临时文件和构建缓存放在该目录；不要把工作目录指向源仓库。构建结果在 `<工作目录>\dist\CodexBrowserUnlocker.exe`。构建不安装、关闭或重启 Codex，也不修改活动 CUA 服务。
+
 ## English
 
 This standalone Windows script adapts the browser-identification callback used by specific Codex Desktop CUA runtimes. It targets the `unsupported Codex auth method: apikey` error observed on first use of the Edge/Chrome extension through `mcp__cua_repl` under API-key-only authentication. It extracts the narrow, reversible fix from [CodexPlusPlus PR #2335](https://github.com/BigPizzaV3/CodexPlusPlus/pull/2335); it is unofficial and does not fix every symptom in [issue #2294](https://github.com/BigPizzaV3/CodexPlusPlus/issues/2294).
 
-The script discovers the selected runtime from Codex's generated `unified-computer-use/.mcp.json` descriptor. It changes **one** verified `browser-service.mjs` file, keeping the original bytes, candidate bytes, and recovery journal outside the cache. It does not edit the app package, `codex.exe`, config, credentials, plugin descriptors, or browser extensions. Only the exact Windows CUA 0.0.11 and 0.0.24 component fingerprints are supported; unknown versions fail closed.
+The tool discovers the selected runtime from Codex's generated `unified-computer-use/.mcp.json` descriptor. It changes **one** verified `browser-service.mjs` file, keeping the original bytes, candidate bytes, and recovery journal outside the cache. It does not edit the app package, `codex.exe`, config, credentials, plugin descriptors, or browser extensions. Only the exact Windows CUA 0.0.11 and 0.0.24 component fingerprints are supported; unknown versions fail closed.
 
 The helper requires request identification only for the verified stable Edge/Chrome extensions during a valid turn with the explicit local control enabled. It does not impersonate an account or bypass site policy, operation approvals, or stop handling. **Restoring the service does not undo identification retained by the extension**: destination sites may still receive `x-browser-agent: ChatGPT/<session-id>` until the extension's own state is changed.
 
 ### Quick start
 
-Install Python 3.10+ on Windows; no pip dependencies or elevation are needed. Let Codex generate the plugin descriptor once, then save your work and **fully quit Codex and Codex++** before applying or restoring this patch. The script refuses to change the real cache while it detects a running Codex/Codex++/CUA process; keep the apps closed until the command finishes, since it cannot prevent a later concurrent launch. Do **not** use it alongside Codex++'s native Edge/Chrome identification option: `apply` refuses any existing Codex++ native-browser state directory; users of that option should use the built-in implementation. Restore this standalone patch before enabling the Codex++ option again. From PowerShell in the repository directory:
+The Windows EXE needs no Python installation; the source script requires Python 3.10+ and no pip dependencies or elevation. Let Codex generate the plugin descriptor once, then save your work and **fully quit Codex and Codex++** before applying or restoring this patch. The tool refuses to change the real cache while it detects a running Codex/Codex++/CUA process; keep the apps closed until the command finishes, since it cannot prevent a later concurrent launch. Do **not** use it alongside Codex++'s native Edge/Chrome identification option: `apply` refuses any existing Codex++ native-browser state directory; users of that option should use the built-in implementation. Restore this standalone patch before enabling the Codex++ option again.
+
+Download the unsigned EXE from [Releases](https://github.com/Yuimi-chaya/codex-windows-apikey-browser/releases) and verify its published SHA-256. The GUI shows the registered Codex App version/install location for identification and the **actual CUA service file** it will change. "选择 Codex 路径" selects a `.codex` **data directory** containing the plugin cache, not the app installation. Status checks are read-only. Fully quit Codex/Codex++ before clicking "解锁浏览器" (apply) or "还原" (restore). An "已解锁（磁盘状态）" status confirms the on-disk patch and recovery record, **not** browser connectivity. Unknown fingerprints, external changes, recovery conflicts, and running processes are refused.
+
+Alternatively, from PowerShell in the repository directory:
 
 ```powershell
 py -3 .\codex_browser_patch.py status
@@ -74,3 +88,5 @@ By default the script checks `%CODEX_HOME%` (if set) and `%USERPROFILE%\.codex`,
 Run `py -3 -m unittest discover -s tests -v` for synthetic tests. The optional genuine-byte test reads an unmodified local runtime and descriptor, then works exclusively in a temporary copy; it never executes proprietary runtime code. This repository redistributes no native binaries, extensions, credentials, or keys. The code is derived from CodexPlusPlus and licensed under [GNU AGPL-3.0](LICENSE). Not affiliated with or endorsed by OpenAI.
 
 For the optional genuine-byte test, set `CODEX_BROWSER_FIXTURE_RUNTIME` and `CODEX_BROWSER_FIXTURE_DESCRIPTOR`. If the live service is already adapted, set `CODEX_BROWSER_FIXTURE_SERVICE` to a fingerprint-verified original backup; it is read only. `CODEX_BROWSER_TEST_TEMP` can place the temporary copy on a larger drive.
+
+To build from source, install the pinned PyInstaller version in an isolated environment with `build.ps1 -WorkRoot <dedicated-directory>`. The script places its virtual environment, temporary files, and build cache outside the repository and writes `<work-root>\dist\CodexBrowserUnlocker.exe`. It never installs, stops, restarts, or patches a running Codex instance.

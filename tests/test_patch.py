@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import codex_browser_patch as patch
+import browser_unlocker_gui as gui
 
 
 KEY = "0123456789abcdef"
@@ -96,6 +97,96 @@ class Fixture(unittest.TestCase):
         patch.apply(self.runtime_root, self.state, self.selection)
         patch.restore(self.runtime_root, self.state)
         self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_gui_status_transitions_are_read_only(self):
+        missing, selection = gui.inspect(self.home, self.runtime_root, self.state)
+        self.assertEqual(self.selection, selection)
+        self.assertEqual("original", missing.code)
+        self.assertEqual("fixture", missing.version)
+        self.assertTrue(missing.can_apply)
+        self.assertFalse(missing.can_restore)
+        self.assertFalse(self.state.exists())
+
+        patch.apply(self.runtime_root, self.state, self.selection)
+        prepared, _ = gui.inspect(self.home, self.runtime_root, self.state)
+        self.assertEqual("patched", prepared.code)
+        self.assertFalse(prepared.can_apply)
+        self.assertTrue(prepared.can_restore)
+
+        (self.state / "control.json").write_bytes(patch.control_bytes(False))
+        disabled, _ = gui.inspect(self.home, self.runtime_root, self.state)
+        self.assertEqual("disabled", disabled.code)
+        self.assertTrue(disabled.can_apply)
+        self.assertTrue(disabled.can_restore)
+        patch.restore(self.runtime_root, self.state)
+        restored, _ = gui.inspect(self.home, self.runtime_root, self.state)
+        self.assertEqual("original", restored.code)
+        self.assertTrue(restored.can_apply)
+        self.assertTrue(restored.can_restore)
+
+    def test_gui_status_refuses_foreign_or_corrupt_state(self):
+        self.state.mkdir()
+        (self.state / "foreign.txt").write_text("leave alone", encoding="utf-8")
+        state = patch.inspect_status(self.runtime_root, self.state, self.selection)
+        self.assertEqual("conflict", state.code)
+        self.assertFalse(state.can_apply)
+        self.assertFalse(state.can_restore)
+        self.assertEqual(b"fixture-manifest", (self.runtime / "manifest.json").read_bytes())
+
+    def test_gui_status_tracks_orphan_and_corrupt_owner(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        (self.state / "owner.json").unlink()
+        recoverable = patch.inspect_status(self.runtime_root, self.state, self.selection)
+        self.assertTrue(recoverable.can_restore)
+        self.assertFalse(recoverable.can_apply)
+        (self.state / "owner.json").write_bytes(b"foreign")
+        conflict = patch.inspect_status(self.runtime_root, self.state, self.selection)
+        self.assertEqual("conflict", conflict.code)
+        self.assertFalse(conflict.can_restore)
+
+    def test_gui_status_unknown_component_and_external_change(self):
+        self.service.write_bytes(b"foreign adapter")
+        changed = patch.inspect_status(self.runtime_root, self.state, self.selection)
+        self.assertEqual("conflict", changed.code)
+        self.assertFalse(changed.can_apply)
+        self.service.write_bytes(self.original)
+        (self.runtime / "bin/node_repl.exe").write_bytes(b"different")
+        unknown = patch.inspect_status(self.runtime_root, self.state, self.selection)
+        self.assertEqual("unsupported", unknown.code)
+        self.assertFalse(unknown.can_apply)
+
+    def test_gui_status_blocks_live_write_while_running(self):
+        with mock.patch.object(patch, "require_offline",
+                               side_effect=patch.Refused("Codex is still running")):
+            state = patch.inspect_status(self.runtime_root, self.state, self.selection)
+        self.assertEqual("running", state.code)
+        self.assertFalse(state.can_apply)
+        self.assertFalse(state.can_restore)
+
+    def test_gui_no_descriptor_keeps_verified_recovery(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        snapshot = patch.inspect_status(self.runtime_root, self.state, None)
+        self.assertEqual("missing", snapshot.code)
+        self.assertTrue(snapshot.can_restore)
+
+    def test_gui_malformed_descriptor_does_not_hide_restore(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        (self.descriptor_dir / ".mcp.json").write_bytes(b"{broken")
+        snapshot, selection = gui.inspect(self.home, self.runtime_root, self.state)
+        self.assertIsNone(selection)
+        self.assertIn("descriptor", snapshot.detail)
+        self.assertTrue(snapshot.can_restore)
+        self.assertFalse(snapshot.can_apply)
+
+    def test_gui_status_disables_restore_when_another_cache_is_orphaned(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        other = self.runtime_root / "fedcba9876543210" / patch.SERVICE
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"cppNativeIdentificationReader orphan")
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection)
+        self.assertEqual("conflict", snapshot.code)
+        self.assertFalse(snapshot.can_restore)
+        self.assertIn("no matching recovery journal", snapshot.detail)
 
     def test_unknown_component_never_writes(self):
         (self.runtime / "bin/node_repl.exe").write_bytes(b"changed")
