@@ -20,7 +20,7 @@
 
 ### 图形界面
 
-目前已发布的 `v0.1.0-beta.1` **尚不支持**上述 Codex++ 状态互操作；本分支的 `v0.1.0-beta.2` 是待真人验收的本地候选，不要把旧版 EXE 当作新版测试。从 [Releases](https://github.com/Yuimi-chaya/codex-windows-apikey-browser/releases) 获取已发布版本时，核对发布页的 SHA-256。界面自动读取当前用户注册的 Codex App 版本与安装路径，并通过 Codex 数据目录中的插件描述文件定位实际 CUA 服务。**安装路径仅供识别；补丁修改的是界面显示的“实际补丁文件”，而不是安装包。**“选择 Codex 路径”用于选择包含插件缓存的 `.codex` **数据目录**，不接受 App 安装目录。未签名的 EXE 可能触发 Windows 安全警告。
+`v0.1.0` 正式版支持上述 Codex++ 状态互操作；旧的 `v0.1.0-beta.1` 不支持，请勿混用。从 [Releases](https://github.com/Yuimi-chaya/codex-windows-apikey-browser/releases) 下载 Windows EXE，并核对发布页的 SHA-256。界面自动读取当前用户注册的 Codex App 版本与安装路径，并通过 Codex 数据目录中的插件描述文件定位实际 CUA 服务。**安装路径仅供识别；补丁修改的是界面显示的“实际补丁文件”，而不是安装包。**“选择 Codex 路径”用于选择包含插件缓存的 `.codex` **数据目录**，不接受 App 安装目录。未签名的 EXE 可能触发 Windows 安全警告。
 
 状态检查只读，会显示当前匹配的是独立工具还是 Codex++ 的恢复资料。退出 Codex / Codex++ 后，点击“解锁浏览器”，重新打开 Codex，并在新的浏览器工具上下文中测试。需要撤销时，再次退出应用并点击“恢复原件”。状态“已解锁（磁盘状态）”只表明文件与相应恢复记录一致，**不是**浏览器连接成功的证明。未知组件指纹会阻止解锁，但完整可信的恢复记录仍可能允许还原；其他修改、恢复资料冲突或运行进程会阻止写入。不要直接替换文件或删除恢复资料。
 
@@ -75,7 +75,7 @@ The Windows EXE needs no Python installation; the source script requires Python 
 
 Codex++ takes a snapshot of its native Edge/Chrome compatibility setting when its launcher starts. If you continue launching through Codex++, leave that built-in option **enabled**; with it disabled, the next launcher start restores the service even after this tool unlocks it. This tool neither changes that setting nor overrides an active monitor. Unknown Codex++ journals, missing locks, invalid/unfinished monitor receipts, simultaneous active adapters, and external edits fail closed.
 
-The published `v0.1.0-beta.1` does **not** have Codex++ interoperability; this branch's `v0.1.0-beta.2` is a local candidate awaiting human validation. Verify the published SHA-256 when downloading a published EXE from [Releases](https://github.com/Yuimi-chaya/codex-windows-apikey-browser/releases). The GUI shows the registered Codex App version/install location for identification and the **actual CUA service file** it will change. "选择 Codex 路径" selects a `.codex` **data directory** containing the plugin cache, not the app installation. Status checks are read-only and identify the recovery owner. Fully quit Codex/Codex++ before clicking "解锁浏览器" (apply) or "恢复原件" (restore). An "已解锁（磁盘状态）" status confirms the on-disk patch and recovery record, **not** browser connectivity. Unknown component fingerprints block unlocking, but a fully verified recovery record may still allow restoration; external edits, recovery conflicts, and running processes block writes.
+The stable `v0.1.0` release supports Codex++ recovery-state interoperability; the older `v0.1.0-beta.1` does **not**. Download the Windows EXE from [Releases](https://github.com/Yuimi-chaya/codex-windows-apikey-browser/releases) and verify its published SHA-256. The GUI shows the registered Codex App version/install location for identification and the **actual CUA service file** it will change. "选择 Codex 路径" selects a `.codex` **data directory** containing the plugin cache, not the app installation. Status checks are read-only and identify the recovery owner. Fully quit Codex/Codex++ before clicking "解锁浏览器" (apply) or "恢复原件" (restore). An "已解锁（磁盘状态）" status confirms the on-disk patch and recovery record, **not** browser connectivity. Unknown component fingerprints block unlocking, but a fully verified recovery record may still allow restoration; external edits, recovery conflicts, and running processes block writes.
 
 Alternatively, from PowerShell in the repository directory:
 

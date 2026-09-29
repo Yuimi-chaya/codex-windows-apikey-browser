@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 import codex_browser_patch as patch
 
 
-VERSION = "0.1.0-beta.2"
+VERSION = "0.1.0"
 LABELS = {
     "missing": ("未找到浏览器运行时", "#976116"),
     "original": ("可解锁", "#186649"),
