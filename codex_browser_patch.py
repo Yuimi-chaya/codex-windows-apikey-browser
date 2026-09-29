@@ -4,7 +4,7 @@
 import argparse
 from contextlib import contextmanager
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import msvcrt
@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 
 
 SERVICE = "bin/node_modules/@oai/browser-desktop/scripts/browser-service.mjs"
@@ -63,6 +64,8 @@ class PatchStatus:
     can_apply: bool = False
     can_restore: bool = False
     recovery_count: int = 0
+    owner: str = ""
+    recovery_root: str = ""
 
 
 def require(condition, message):
@@ -137,6 +140,20 @@ def validate_locations(runtime_root, state_root):
             "Recovery must not overlap Codex++ native browser state")
 
 
+def cpp_state_root():
+    return Path.home() / ".codex-session-delete/native-browser-identification"
+
+
+def live_runtime(runtime_root):
+    local = os.environ.get("LOCALAPPDATA")
+    return bool(local and same_path(runtime_root, Path(local) / "OpenAI/Codex/runtimes/cua_node"))
+
+
+def is_file_lock(error):
+    return isinstance(error, OSError) and (
+        getattr(error, "winerror", None) in (32, 33) or error.errno in (32, 33))
+
+
 def owns_state(state_root):
     marker = state_root / "owner.json"
     return marker.exists() and read_regular(marker, 256) == OWNER
@@ -176,8 +193,7 @@ def disable_recognizable_control(state_root):
 
 
 def require_offline(runtime_root):
-    local = os.environ.get("LOCALAPPDATA")
-    if not local or not same_path(runtime_root, Path(local) / "OpenAI/Codex/runtimes/cua_node"):
+    if not live_runtime(runtime_root):
         return  # Relocated fixture: never inspect unrelated live processes.
     try:
         result = subprocess.run(["tasklist.exe", "/fo", "csv", "/nh"], capture_output=True,
@@ -201,12 +217,11 @@ def require_no_codexpp_state(runtime_root):
 
 
 @contextmanager
-def codexpp_guard(runtime_root, key=None):
-    local = os.environ.get("LOCALAPPDATA")
-    if not local or not same_path(runtime_root, Path(local) / "OpenAI/Codex/runtimes/cua_node"):
+def codexpp_guard(runtime_root, key=None, root_override=None):
+    if root_override is None and not live_runtime(runtime_root):
         yield
         return
-    cpp_root = Path.home() / ".codex-session-delete/native-browser-identification"
+    cpp_root = root_override or cpp_state_root()
     if not cpp_root.exists():
         yield
         return
@@ -215,8 +230,7 @@ def codexpp_guard(runtime_root, key=None):
         raise Refused("Codex++ native browser state exists; use its built-in option instead")
     monitor = cpp_root / "monitor.lock"
     if not monitor.exists():
-        yield
-        return
+        raise Refused("Codex++ state has no monitor lock")
     plain(monitor)
     try:
         stream = monitor.open("r+b")
@@ -229,6 +243,21 @@ def codexpp_guard(runtime_root, key=None):
         except OSError as exc:
             raise Refused("Codex++ native browser monitor is active; exit Codex++ first") from exc
         try:
+            stream.seek(0)
+            data = stream.read(1025)
+            require(len(data) <= 1024, "Invalid Codex++ monitor receipt")
+            try:
+                receipt = json.loads(data)
+                require(isinstance(receipt, dict) and
+                        set(receipt) == {"schema", "generation", "state"} and
+                        type(receipt["schema"]) is int and receipt["schema"] == 1 and
+                        isinstance(receipt["generation"], str) and
+                        isinstance(receipt["state"], str) and
+                        receipt["state"] in {"restored", "blocked"},
+                        "Invalid or unfinished Codex++ monitor receipt")
+                uuid.UUID(receipt["generation"])
+            except (ValueError, TypeError, KeyError) as exc:
+                raise Refused("Invalid Codex++ monitor receipt") from exc
             yield
         finally:
             stream.seek(0)
@@ -369,10 +398,27 @@ def locked(state_root):
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+@contextmanager
+def locked_existing(state_root):
+    lock_path = plain(state_root / "owner.lock")
+    with lock_path.open("r+b") as lock:
+        try:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise Refused("Another browser patch transaction is active") from exc
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def recovery(state_root, key):
     directory = plain(state_root / key)
     record = json.loads(read_regular(directory / "journal.json", 4096))
-    require(set(record) == {"schema", "original_sha", "candidate_sha", "mtime_ns"} and
+    require(isinstance(record, dict) and
+            set(record) == {"schema", "original_sha", "candidate_sha", "mtime_ns"} and
             record["schema"] == 1 and type(record["mtime_ns"]) is int and
             0 <= record["mtime_ns"] < 2**63 and
             record["original_sha"] in {item["service"] for item in CONTRACTS.values()} and
@@ -409,6 +455,225 @@ def recoverable_without_owner(state_root):
         return True
     except (Refused, OSError, ValueError):
         return False
+
+
+def cpp_recovery(state_root, key):
+    directory = plain(state_root / key)
+    record = json.loads(read_regular(directory / "journal.json", 4096))
+    require(isinstance(record, dict) and
+            set(record) == {"schema", "originalSha", "candidateSha",
+                            "modifiedSecs", "modifiedNanos"} and record["schema"] == 1 and
+            type(record["modifiedSecs"]) is int and type(record["modifiedNanos"]) is int and
+            0 <= record["modifiedSecs"] < 2**63 // 1_000_000_000 and
+            0 <= record["modifiedNanos"] < 1_000_000_000 and
+            isinstance(record["candidateSha"], str) and
+            re.fullmatch("[0-9a-f]{64}", record["candidateSha"]) is not None,
+            "Invalid Codex++ recovery journal")
+    contract = next((item for item in CONTRACTS.values()
+                     if item["service"] == record["originalSha"]), None)
+    require(contract is not None, "Unknown Codex++ original fingerprint")
+    original = read_regular(directory / "original.mjs", MAX_SERVICE)
+    candidate = read_regular(directory / ("candidate-" + record["candidateSha"] + ".mjs"),
+                             MAX_SERVICE)
+    require(sha(original) == contract["service"] and
+            sha(candidate) == record["candidateSha"] and
+            candidate == transform(original, contract, state_root / "control.json"),
+            "Codex++ recovery files do not match the verified callback")
+    mtime_ns = record["modifiedSecs"] * 1_000_000_000 + record["modifiedNanos"]
+    return original, candidate, contract, mtime_ns
+
+
+def cpp_preflight(runtime_root, state_root):
+    result = {}
+    entries = list(state_root.iterdir())
+    require(len(entries) <= 80, "Too many Codex++ state entries")
+    for entry in entries:
+        plain(entry)
+        if KEY_RE.fullmatch(entry.name) and entry.is_dir():
+            require((entry / "journal.json").exists(),
+                    "Incomplete Codex++ recovery directory: " + str(entry))
+        else:
+            require(entry.name in {"owner.lock", "monitor.lock", "control.json", "status.json"}
+                    and entry.is_file(), "Unexpected Codex++ state entry: " + str(entry))
+    for key in records(state_root):
+        original, candidate, contract, mtime_ns = cpp_recovery(state_root, key)
+        target = plain(runtime_root / key / SERVICE)
+        if target.exists():
+            current = read_regular(target, MAX_SERVICE)
+            require(current in (original, candidate),
+                    "Codex++ browser service changed outside its recovery journal: " + str(target))
+            result[key] = (target, current, original, candidate, contract, mtime_ns)
+    return result
+
+
+def cpp_control_enabled(state_root):
+    control = state_root / "control.json"
+    if not control.exists():
+        return None
+    value = json.loads(read_regular(control, 1024))
+    require(isinstance(value, dict) and set(value) == {"schema", "requireIdentification"} and
+            value["schema"] == 1 and type(value["requireIdentification"]) is bool,
+            "Invalid Codex++ control state")
+    return value["requireIdentification"]
+
+
+def require_standalone_restored(runtime_root, state_root, known_cpp=None):
+    if not state_root.exists():
+        return
+    keys = records(state_root)
+    marker = state_root / "owner.json"
+    require(owns_state(state_root) or
+            (keys and not marker.exists() and recoverable_without_owner(state_root)),
+            "Standalone recovery ownership cannot be verified")
+    for entry in state_root.iterdir():
+        plain(entry)
+        if KEY_RE.fullmatch(entry.name) and entry.is_dir():
+            require(entry.name in keys, "Incomplete standalone recovery directory")
+        else:
+            require(entry.name in {"owner.lock", "owner.json", "control.json"} and
+                    entry.is_file(), "Unexpected standalone recovery entry")
+    if (state_root / "control.json").exists():
+        require(control_is_recognizable(state_root) and
+                not json.loads(read_regular(state_root / "control.json", 1024))
+                ["requireIdentification"],
+                "Disable the standalone control before using Codex++ state")
+    for key in keys:
+        _, original, candidate = recovery(state_root, key)
+        contract = next((item for item in CONTRACTS.values()
+                         if item["service"] == sha(original)), None)
+        require(contract is not None and
+                candidate == transform(original, contract, state_root / "control.json"),
+                "Standalone recovery callback is not verified")
+        target = runtime_root / key / SERVICE
+        if target.exists():
+            current = read_regular(target, MAX_SERVICE)
+            if known_cpp and key in known_cpp:
+                _, _, cpp_original, cpp_candidate, _, _ = known_cpp[key]
+                if cpp_original == original and current == cpp_candidate:
+                    continue
+            require(current == original, "Restore the standalone adapter before using Codex++ state"
+                    if current == candidate else "Standalone recovery has an external change")
+
+
+def standalone_active(runtime_root, state_root):
+    for key in records(state_root):
+        _, original, candidate = recovery(state_root, key)
+        target = runtime_root / key / SERVICE
+        if target.exists() and read_regular(target, MAX_SERVICE) == candidate:
+            return True
+    return False
+
+
+def apply_unified(runtime_root, state_root, selection, cpp_root=None):
+    cpp_root = cpp_root or (cpp_state_root() if live_runtime(runtime_root) else None)
+    if cpp_root is None or not cpp_root.exists():
+        return apply(runtime_root, state_root, selection)
+    validate_locations(runtime_root, state_root)
+    require(outside_runtime(runtime_root, cpp_root), "Codex++ state must be outside the runtime")
+    require(outside_runtime(cpp_root, state_root) and outside_runtime(state_root, cpp_root),
+            "Recovery directories must not overlap")
+    require(selection is not None, "No generated CUA browser descriptor found")
+    require_offline(runtime_root)
+    with codexpp_guard(runtime_root, root_override=cpp_root):
+        require((cpp_root / "owner.lock").exists(), "Codex++ state has no transaction lock")
+        with locked(cpp_root):
+            existing = cpp_preflight(runtime_root, cpp_root)
+            require_standalone_restored(runtime_root, state_root, existing)
+            refuse_orphaned_services(runtime_root, set(records(cpp_root)) | set(records(state_root)))
+            cpp_control_enabled(cpp_root)
+            key, home = selection
+            runtime = plain(runtime_root / key)
+            target = plain(runtime / SERVICE)
+            contract = select_contract(runtime)
+            current = read_regular(target, MAX_SERVICE)
+            for other_key, (_, old_current, old_original, _, _, _) in existing.items():
+                if other_key != key:
+                    require(old_current == old_original,
+                            "Restore the previous Codex++ cache before unlocking another")
+            control = cpp_root / "control.json"
+            if key in existing:
+                _, known_current, original, candidate, recorded_contract, _ = existing[key]
+                require(recorded_contract["service"] == contract["service"] and
+                        current == known_current, "Codex++ runtime changed during inspection")
+                if current == original:
+                    seconds, nanos = divmod(target.stat().st_mtime_ns, 1_000_000_000)
+                    record = {"schema": 1, "originalSha": contract["service"],
+                              "candidateSha": sha(candidate), "modifiedSecs": seconds,
+                              "modifiedNanos": nanos}
+                    atomic_write(cpp_root / key / "journal.json",
+                                 json.dumps(record, separators=(",", ":")).encode("utf-8"))
+            else:
+                require(sha(current) == contract["service"],
+                        "Browser service is not a verified original")
+                original = current
+                candidate = transform(original, contract, control)
+                require(len(candidate) <= MAX_SERVICE, "Candidate browser service is too large")
+                directory = plain(cpp_root / key)
+                directory.mkdir(exist_ok=True)
+                backup = directory / "original.mjs"
+                if backup.exists():
+                    require(read_regular(backup, MAX_SERVICE) == original,
+                            "Unjournaled Codex++ original conflicts")
+                else:
+                    write_new(backup, original)
+                candidate_path = directory / ("candidate-" + sha(candidate) + ".mjs")
+                if candidate_path.exists():
+                    require(read_regular(candidate_path, MAX_SERVICE) == candidate,
+                            "Unjournaled Codex++ candidate conflicts")
+                else:
+                    write_new(candidate_path, candidate)
+                seconds, nanos = divmod(target.stat().st_mtime_ns, 1_000_000_000)
+                record = {"schema": 1, "originalSha": contract["service"],
+                          "candidateSha": sha(candidate), "modifiedSecs": seconds,
+                          "modifiedNanos": nanos}
+                atomic_write(directory / "journal.json",
+                             json.dumps(record, separators=(",", ":")).encode("utf-8"))
+            try:
+                atomic_write(control, control_bytes(False))
+                if current == original:
+                    require_offline(runtime_root)
+                    require(read_regular(target, MAX_SERVICE) == original,
+                            "Concurrent runtime change")
+                    atomic_write(target, candidate)
+                    require(read_regular(target, MAX_SERVICE) == candidate,
+                            "Browser service verification failed")
+                atomic_write(control, control_bytes(True))
+            except Exception:
+                atomic_write(control, control_bytes(False))
+                raise
+    print("Prepared verified Codex++ CUA " + contract["version"] + " from " + home)
+    print("Codex++ launcher must have its native browser option enabled on future starts.")
+
+
+def restore_unified(runtime_root, state_root, cpp_root=None):
+    cpp_root = cpp_root or (cpp_state_root() if live_runtime(runtime_root) else None)
+    if cpp_root is None or not cpp_root.exists():
+        return restore(runtime_root, state_root)
+    if not records(cpp_root) and standalone_active(runtime_root, state_root):
+        return restore(runtime_root, state_root)
+    validate_locations(runtime_root, state_root)
+    require(outside_runtime(runtime_root, cpp_root), "Codex++ state must be outside the runtime")
+    require(outside_runtime(cpp_root, state_root) and outside_runtime(state_root, cpp_root),
+            "Recovery directories must not overlap")
+    require_offline(runtime_root)
+    with codexpp_guard(runtime_root, root_override=cpp_root):
+        require((cpp_root / "owner.lock").exists(), "Codex++ state has no transaction lock")
+        with locked(cpp_root):
+            existing = cpp_preflight(runtime_root, cpp_root)
+            require_standalone_restored(runtime_root, state_root, existing)
+            refuse_orphaned_services(runtime_root, set(records(cpp_root)) | set(records(state_root)))
+            cpp_control_enabled(cpp_root)
+            atomic_write(cpp_root / "control.json", control_bytes(False))
+            pending = [(target, candidate, original, mtime_ns)
+                       for target, current, original, candidate, _, mtime_ns in existing.values()
+                       if current == candidate]
+            for target, candidate, original, mtime_ns in pending:
+                require_offline(runtime_root)
+                require(read_regular(target, MAX_SERVICE) == candidate, "Concurrent runtime change")
+                atomic_write(target, original, mtime_ns)
+                require(read_regular(target, MAX_SERVICE) == original,
+                        "Restoration verification failed")
+    print("Restored " + str(len(pending)) + " verified Codex++ browser service(s).")
 
 
 def apply(runtime_root, state_root, selection):
@@ -554,8 +819,8 @@ def restore(runtime_root, state_root):
     print("The browser extension may retain request identification until changed in the extension.")
 
 
-def inspect_status(runtime_root, state_root, selection):
-    """Read-only disk diagnosis; action flags are hints, never a substitute for write guards."""
+def _inspect_standalone_status(runtime_root, state_root, selection):
+    """Read-only diagnosis for the standalone recovery format."""
     validate_locations(runtime_root, state_root)
     keys = records(state_root)
     owned = state_root.exists() and owns_state(state_root)
@@ -642,19 +907,114 @@ def inspect_status(runtime_root, state_root, selection):
             code = "running"
             can_apply = can_restore = False
     return PatchStatus(code, detail, version, home, service,
-                       can_apply, can_restore, len(keys))
+                       can_apply, can_restore, len(keys),
+                       "standalone" if keys else "", str(state_root))
+
+
+def inspect_status(runtime_root, state_root, selection, cpp_root=None):
+    """Classify the verified on-disk owner before offering either operation."""
+    validate_locations(runtime_root, state_root)
+    cpp_root = cpp_root or (cpp_state_root() if live_runtime(runtime_root) else None)
+    if cpp_root is not None:
+        require(outside_runtime(runtime_root, cpp_root) and
+                outside_runtime(cpp_root, state_root) and
+                outside_runtime(state_root, cpp_root),
+                "Recovery directories must not overlap")
+    home = selection[1] if selection else ""
+    service = str(runtime_root / selection[0] / SERVICE) if selection else ""
+    owner = "Codex++" if cpp_root is not None and cpp_root.exists() else "standalone"
+    recovery_root = cpp_root if owner == "Codex++" else state_root
+    try:
+        require_offline(runtime_root)
+    except Refused as exc:
+        try:
+            count = len(records(recovery_root))
+        except (Refused, OSError):
+            count = 0
+        return PatchStatus("running", str(exc), home=home, service=service,
+                           recovery_count=count, owner=owner,
+                           recovery_root=str(recovery_root))
+    if owner == "standalone":
+        return _inspect_standalone_status(runtime_root, state_root, selection)
+
+    keys = records(cpp_root)
+    if not keys and records(state_root) and standalone_active(runtime_root, state_root):
+        standalone = _inspect_standalone_status(runtime_root, state_root, selection)
+        if standalone.can_restore:
+            try:
+                with codexpp_guard(runtime_root, root_override=cpp_root):
+                    pass
+            except Refused as exc:
+                return replace(standalone, code=("conflict" if "no monitor lock" in str(exc)
+                                                 else "running"), detail=str(exc),
+                               can_restore=False)
+            return replace(standalone, can_apply=False)
+    version = ""
+    code = "missing"
+    detail = "No generated CUA browser descriptor found. Start Codex once, then refresh."
+    can_apply = False
+    can_restore = bool(keys)
+    try:
+        require((cpp_root / "owner.lock").exists(), "Codex++ state has no transaction lock")
+        with codexpp_guard(runtime_root, root_override=cpp_root):
+            with locked_existing(cpp_root):
+                existing = cpp_preflight(runtime_root, cpp_root)
+                require_standalone_restored(runtime_root, state_root, existing)
+                control = cpp_control_enabled(cpp_root)
+                refuse_orphaned_services(runtime_root,
+                                         set(keys) | set(records(state_root)))
+                if selection:
+                    key, _ = selection
+                    try:
+                        contract = select_contract(runtime_root / key)
+                        version = contract["version"]
+                        current = read_regular(runtime_root / key / SERVICE, MAX_SERVICE)
+                        if key in existing:
+                            _, _, original, candidate, recorded_contract, _ = existing[key]
+                            require(recorded_contract["service"] == contract["service"] and
+                                    current in (original, candidate),
+                                    "Codex++ runtime differs from its recovery journal")
+                        else:
+                            original, candidate = None, None
+                        if current == candidate:
+                            code = "patched" if control else "disabled"
+                            detail = ("Verified Codex++ adapter is enabled on disk."
+                                      if control else "Codex++ adapter is present, but its control is off.")
+                            can_apply = not control
+                        elif sha(current) == contract["service"]:
+                            code = "original"
+                            detail = "Supported original service; Codex++ recovery is available."
+                            can_apply = True
+                        else:
+                            raise Refused("Browser service has an unknown or externally modified fingerprint")
+                        if any(other != key and entry[1] == entry[3]
+                               for other, entry in existing.items()):
+                            can_apply = False
+                            detail = "Restore the previous Codex++ cache before unlocking another."
+                    except Refused as exc:
+                        code, detail, can_apply = "unsupported", str(exc), False
+    except (Refused, OSError, ValueError, UnicodeError) as exc:
+        code = "running" if (is_file_lock(exc) or
+                             "monitor is active" in str(exc) or
+                             "transaction is active" in str(exc)) else "conflict"
+        detail = str(exc)
+        can_apply = False
+        can_restore = False
+    return PatchStatus(code, detail, version, home, service, can_apply,
+                       can_restore, len(keys), "Codex++", str(cpp_root))
 
 
 def status(runtime_root, state_root, selection):
     print("CUA runtime root: " + str(runtime_root))
-    print("Recovery root: " + str(state_root))
     snapshot = inspect_status(runtime_root, state_root, selection)
+    print("Recovery root: " + (snapshot.recovery_root or str(state_root)))
+    print("Recovery owner: " + (snapshot.owner or "none"))
     if selection:
         print("Selected by " + snapshot.home + ": " + selection[0])
     print("Patch status: " + snapshot.code + "; " + snapshot.detail)
     if snapshot.version:
         print("CUA fingerprint: " + snapshot.version)
-    for key in records(state_root):
+    for key in records(Path(snapshot.recovery_root or state_root)):
         print("Retained recovery: " + key)
 
 
@@ -679,19 +1039,23 @@ def main():
         if all(not same_path(home, fallback) for home in homes):
             homes.append(fallback)
     if args.action == "restore":
-        restore(runtime_root, state_root)
+        restore_unified(runtime_root, state_root)
     else:
         try:
             selection = find_runtime(homes, runtime_root)
         except Exception as error:
             if args.action == "apply":
-                try:
-                    disable_owned_control(state_root)
-                except Exception as disable_error:
-                    raise Refused(f"{error}; also failed to disable local control: {disable_error}") from disable_error
+                if not cpp_state_root().exists():
+                    require_offline(runtime_root)
+                    try:
+                        disable_owned_control(state_root)
+                    except Exception as disable_error:
+                        raise Refused(
+                            f"{error}; also failed to disable local control: {disable_error}"
+                        ) from disable_error
             raise
         if args.action == "apply":
-            apply(runtime_root, state_root, selection)
+            apply_unified(runtime_root, state_root, selection)
         else:
             status(runtime_root, state_root, selection)
 

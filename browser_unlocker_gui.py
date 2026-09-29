@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 import codex_browser_patch as patch
 
 
-VERSION = "0.1.0-beta.1"
+VERSION = "0.1.0-beta.2"
 LABELS = {
     "missing": ("未找到浏览器运行时", "#976116"),
     "original": ("可解锁", "#186649"),
@@ -58,7 +58,7 @@ def default_homes():
     return homes
 
 
-def inspect(home_override=None, runtime_root=None, state_root=None):
+def inspect(home_override=None, runtime_root=None, state_root=None, cpp_root=None):
     """No filesystem writes; path overrides also enable isolated fixture tests."""
     local = os.environ.get("LOCALAPPDATA")
     patch.require(local or runtime_root is not None, "LOCALAPPDATA is missing")
@@ -68,10 +68,12 @@ def inspect(home_override=None, runtime_root=None, state_root=None):
     try:
         selection = patch.find_runtime(homes, runtime_root)
     except (patch.Refused, OSError, ValueError, UnicodeError) as exc:
-        snapshot = patch.inspect_status(runtime_root, state_root, None)
-        return replace(snapshot, code="unsupported",
-                       detail="CUA descriptor cannot be used: " + str(exc)), None
-    return patch.inspect_status(runtime_root, state_root, selection), selection
+        snapshot = patch.inspect_status(runtime_root, state_root, None, cpp_root)
+        return replace(snapshot, code=("running" if snapshot.code == "running"
+                                       else "unsupported"),
+                       detail=snapshot.detail + "\nCUA descriptor cannot be used: " +
+                       str(exc)), None
+    return patch.inspect_status(runtime_root, state_root, selection, cpp_root), selection
 
 
 def probe():
@@ -87,14 +89,17 @@ def probe():
 def detail_text(snapshot):
     messages = {
         "missing": "尚未找到生成的 CUA 浏览器描述文件。启动过 Codex 后刷新。",
-        "original": "服务文件为受支持的原件。退出 Codex 后可进行解锁。",
-        "patched": "文件和本工具的恢复记录一致。仍需重新打开 Codex 实测浏览器。",
-        "disabled": "补丁文件仍在，但本地开关已关闭。可在退出应用后重新启用或还原。",
+        "original": "服务文件为受支持的原件。退出应用后可进行解锁。",
+        "patched": "文件和恢复记录一致。仍需重新打开 Codex 实测浏览器。",
+        "disabled": "补丁文件仍在，但本地开关已关闭。退出应用后可重新启用或恢复。",
         "unsupported": "当前运行时或插件描述文件不在已验证范围内。",
         "conflict": "检测到其他修改或恢复资料冲突，本工具不会覆盖。",
-        "running": "Codex / Codex++ 尚在运行。请正常退出后刷新。",
+        "running": "服务正在使用或监控仍在运行。退出 Codex / Codex++ 后刷新。",
     }
     text = messages[snapshot.code]
+    if snapshot.owner == "Codex++" and snapshot.code in {"original", "patched", "disabled"}:
+        text += ("\n经 Codex++ 启动时，其内建兼容选项须保持开启；"
+                 "若设为关闭，下一次 launcher 启动会还原此补丁。")
     if snapshot.code in {"unsupported", "conflict", "running"}:
         text += "\n" + snapshot.detail
     return text
@@ -132,7 +137,7 @@ class Unlocker(tk.Tk):
 
         header = tk.Frame(outer, bg="#f4f6f5")
         header.grid(row=0, column=0, sticky="ew")
-        tk.Label(header, text="Codex 浏览器解锁", font=("Microsoft YaHei UI", 17, "bold"),
+        tk.Label(header, text="Codex 浏览器恢复与解锁", font=("Microsoft YaHei UI", 17, "bold"),
                  bg="#f4f6f5", fg="#1c2925").pack(side="left")
         tk.Label(header, text="v" + VERSION, font=("Segoe UI", 9),
                  bg="#f4f6f5", fg="#66766e").pack(side="right", pady=7)
@@ -185,7 +190,7 @@ class Unlocker(tk.Tk):
         self.refresh_button = ttk.Button(footer, text="刷新", style="Tool.TButton",
                                          command=self.refresh)
         self.refresh_button.pack(side="left", padx=(8, 0))
-        self.restore_button = ttk.Button(footer, text="还原", style="Action.TButton",
+        self.restore_button = ttk.Button(footer, text="恢复原件", style="Action.TButton",
                                          command=lambda: self.perform("restore"))
         self.restore_button.pack(side="right")
         self.apply_button = ttk.Button(footer, text="解锁浏览器", style="Action.TButton",
@@ -229,7 +234,7 @@ class Unlocker(tk.Tk):
                                 default_homes()[0])),
                     "cua_version": snapshot.version or "未知",
                     "service": snapshot.service or "未选中",
-                    "recovery": str(self.state_root) + "  (" +
+                    "recovery": (snapshot.recovery_root or str(self.state_root)) + "  (" +
                                 str(snapshot.recovery_count) + " 条恢复记录)",
                 }
                 for key, text in values.items():
@@ -289,8 +294,8 @@ class Unlocker(tk.Tk):
         allowed = self.snapshot.can_apply if action == "apply" else self.snapshot.can_restore
         if not allowed:
             return
-        verb = "解锁浏览器" if action == "apply" else "还原"
-        target = self.snapshot.service if action == "apply" else str(self.state_root)
+        verb = "解锁浏览器" if action == "apply" else "恢复原件"
+        target = self.snapshot.service if action == "apply" else self.snapshot.recovery_root
         if not messagebox.askyesno("确认" + verb,
                                    "确认 Codex 与 Codex++ 已完全退出，并在操作结束前不会再次启动？\n\n"
                                    "目标：" + target + "\n\n此操作会修改本机 CUA 缓存；"
@@ -303,11 +308,14 @@ class Unlocker(tk.Tk):
                 latest, selection = inspect(self.home_override, self.runtime_root, self.state_root)
                 if action == "apply":
                     patch.require(latest.can_apply, latest.detail)
-                    patch.apply(self.runtime_root, self.state_root, selection)
+                    patch.apply_unified(self.runtime_root, self.state_root, selection)
                     text = "已写入并校验补丁。重新打开 Codex 后，在新的浏览器工具上下文中真人测试。"
+                    if latest.owner == "Codex++":
+                        text += ("\n经 Codex++ 启动时须保持其内建兼容选项开启，"
+                                 "否则下次 launcher 启动会还原补丁。")
                 else:
                     patch.require(latest.can_restore, latest.detail)
-                    patch.restore(self.runtime_root, self.state_root)
+                    patch.restore_unified(self.runtime_root, self.state_root)
                     text = "还原操作完成。已保留恢复资料；扩展内部已保存的请求标识不会由此清除。"
                 self.responses.put(("done", text))
             except (patch.Refused, OSError, ValueError, UnicodeError) as exc:

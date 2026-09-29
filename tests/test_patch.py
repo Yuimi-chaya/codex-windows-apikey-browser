@@ -40,6 +40,7 @@ class Fixture(unittest.TestCase):
         self.home = root / "home"
         self.runtime_root = root / "runtime"
         self.state = root / "state"
+        self.cpp = root / "cpp-state"
         self.runtime = self.runtime_root / KEY
         self.service = self.runtime / patch.SERVICE
         self.original = ("prefix;" + ANCHOR + ";suffix").encode()
@@ -73,6 +74,284 @@ class Fixture(unittest.TestCase):
         self.pins.start()
         self.addCleanup(self.pins.stop)
         self.selection = (KEY, str(self.home))
+
+    def cpp_state(self, enabled=False):
+        self.cpp.mkdir(exist_ok=True)
+        (self.cpp / "owner.lock").touch()
+        (self.cpp / "monitor.lock").write_text(json.dumps({
+            "schema": 1, "generation": "00000000-0000-0000-0000-000000000001",
+            "state": "restored",
+        }), encoding="utf-8")
+        (self.cpp / "control.json").write_bytes(patch.control_bytes(enabled))
+
+    def cpp_journal(self, enabled=True):
+        self.cpp_state(enabled)
+        candidate = patch.transform(self.original, self.contract, self.cpp / "control.json")
+        directory = self.cpp / KEY
+        directory.mkdir(exist_ok=True)
+        (directory / "original.mjs").write_bytes(self.original)
+        (directory / ("candidate-" + patch.sha(candidate) + ".mjs")).write_bytes(candidate)
+        seconds, nanos = divmod(self.service.stat().st_mtime_ns, 1_000_000_000)
+        (directory / "journal.json").write_text(json.dumps({
+            "schema": 1, "originalSha": patch.sha(self.original),
+            "candidateSha": patch.sha(candidate),
+            "modifiedSecs": seconds, "modifiedNanos": nanos,
+        }), encoding="utf-8")
+        return candidate
+
+    def test_unified_cpp_roundtrip_and_read_only_inspection(self):
+        self.cpp_state()
+        before = self.service.stat().st_mtime_ns
+        snapshot, selection = gui.inspect(self.home, self.runtime_root, self.state, self.cpp)
+        self.assertEqual(self.selection, selection)
+        self.assertEqual(("original", "Codex++"), (snapshot.code, snapshot.owner))
+        self.assertEqual(str(self.cpp), snapshot.recovery_root)
+        self.assertTrue(snapshot.can_apply)
+        self.assertEqual("restored", json.loads((self.cpp / "monitor.lock").read_text())
+                         ["state"])
+        self.assertEqual(0, (self.cpp / "owner.lock").stat().st_size)
+        self.assertFalse(self.state.exists())
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        candidate = patch.transform(self.original, self.contract, self.cpp / "control.json")
+        self.assertEqual(candidate, self.service.read_bytes())
+        self.assertFalse(self.state.exists())
+        self.assertTrue(json.loads((self.cpp / "control.json").read_text())
+                        ["requireIdentification"])
+        patched, _ = gui.inspect(self.home, self.runtime_root, self.state, self.cpp)
+        self.assertEqual("patched", patched.code)
+        self.assertTrue(patched.can_restore)
+        self.assertIn("launcher", gui.detail_text(patched))
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        (self.cpp / "control.json").write_bytes(patch.control_bytes(False))
+        disabled = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("disabled", disabled.code)
+        self.assertTrue(disabled.can_apply)
+        patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(self.original, self.service.read_bytes())
+        self.assertEqual(before, self.service.stat().st_mtime_ns)
+        self.assertFalse(json.loads((self.cpp / "control.json").read_text())
+                         ["requireIdentification"])
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual(candidate, self.service.read_bytes())
+
+    def test_unified_existing_cpp_journal_and_component_drift_restoration(self):
+        candidate = self.cpp_journal()
+        self.service.write_bytes(candidate)
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("patched", snapshot.code)
+        (self.runtime / "bin/node_repl.exe").write_bytes(b"new worker")
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("unsupported", snapshot.code)
+        self.assertFalse(snapshot.can_apply)
+        self.assertTrue(snapshot.can_restore)
+        patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_unified_cpp_tamper_and_orphan_refuse_writes(self):
+        candidate = self.cpp_journal()
+        self.service.write_bytes(candidate)
+        (self.cpp / KEY / "journal.json").write_text("{}", encoding="utf-8")
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("conflict", snapshot.code)
+        self.assertFalse(snapshot.can_restore)
+        with self.assertRaises(patch.Refused):
+            patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(candidate, self.service.read_bytes())
+        self.assertTrue(json.loads((self.cpp / "control.json").read_text())
+                        ["requireIdentification"])
+        (self.cpp / KEY / "journal.json").unlink()
+        with self.assertRaises(patch.Refused):
+            patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(candidate, self.service.read_bytes())
+
+    def test_unified_cpp_monitor_blocks_and_status_does_not_write(self):
+        self.cpp_state()
+        monitor = self.cpp / "monitor.lock"
+        with monitor.open("w+b") as stream:
+            stream.write(b"x")
+            stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                snapshot = patch.inspect_status(
+                    self.runtime_root, self.state, self.selection, self.cpp)
+                self.assertEqual("running", snapshot.code)
+                self.assertFalse(snapshot.can_apply)
+                with self.assertRaises(patch.Refused):
+                    patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+                self.assertEqual(self.original, self.service.read_bytes())
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+
+    def test_unified_cpp_missing_monitor_is_not_created(self):
+        self.cpp_state()
+        (self.cpp / "monitor.lock").unlink()
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("conflict", snapshot.code)
+        self.assertFalse(snapshot.can_apply)
+        with self.assertRaisesRegex(patch.Refused, "no monitor lock"):
+            patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertFalse((self.cpp / "monitor.lock").exists())
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_unified_unfinished_monitor_receipt_is_refused(self):
+        self.cpp_state()
+        receipt = self.cpp / "monitor.lock"
+        for contents in (b"", b'{"schema":1,"generation":"bad","state":"restored"}',
+                         b'{"schema":1,"generation":"00000000-0000-0000-0000-000000000001",'
+                         b'"state":"active"}'):
+            receipt.write_bytes(contents)
+            snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+            self.assertEqual("conflict", snapshot.code)
+            with self.assertRaises(patch.Refused):
+                patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+            self.assertEqual(contents, receipt.read_bytes())
+            self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_unified_cpp_transaction_lock_blocks_actions(self):
+        self.cpp_state()
+        with (self.cpp / "owner.lock").open("r+b") as stream:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                snapshot = patch.inspect_status(
+                    self.runtime_root, self.state, self.selection, self.cpp)
+                self.assertEqual("running", snapshot.code)
+                with self.assertRaises(patch.Refused):
+                    patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_unified_cpp_write_failure_keeps_control_disabled(self):
+        self.cpp_state()
+        real_write = patch.atomic_write
+
+        def fail_service(path, data, mtime_ns=None):
+            if path == self.service:
+                raise OSError("simulated service lock")
+            return real_write(path, data, mtime_ns)
+
+        with mock.patch.object(patch, "atomic_write", side_effect=fail_service):
+            with self.assertRaises(OSError):
+                patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual(self.original, self.service.read_bytes())
+        self.assertFalse(json.loads((self.cpp / "control.json").read_text())
+                         ["requireIdentification"])
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertNotEqual(self.original, self.service.read_bytes())
+
+    def test_unified_reapply_uses_new_original_timestamp(self):
+        self.cpp_state()
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        updated = self.service.stat().st_mtime_ns - 2_000_000_000
+        os.utime(self.service, ns=(updated, updated))
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(updated, self.service.stat().st_mtime_ns)
+
+    def test_unified_standalone_restore_after_cpp_state_appears(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        candidate = self.service.read_bytes()
+        self.cpp_state()
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("standalone", snapshot.owner)
+        self.assertTrue(snapshot.can_restore)
+        self.assertFalse(snapshot.can_apply)
+        patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(self.original, self.service.read_bytes())
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertNotEqual(candidate, self.service.read_bytes())
+        self.assertEqual(self.original, (self.state / KEY / "original.mjs").read_bytes())
+
+    def test_unified_two_active_owners_or_external_change_refused(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        standalone_candidate = self.service.read_bytes()
+        self.cpp_journal()
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("conflict", snapshot.code)
+        self.assertFalse(snapshot.can_restore)
+        with self.assertRaises(patch.Refused):
+            patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(standalone_candidate, self.service.read_bytes())
+        patch.restore(self.runtime_root, self.state)
+        self.service.write_bytes(b"foreign")
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("conflict", snapshot.code)
+        with self.assertRaises(patch.Refused):
+            patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual(b"foreign", self.service.read_bytes())
+
+    def test_unified_process_guard_precedes_locked_service_read(self):
+        self.cpp_state()
+        with mock.patch.object(patch, "require_offline",
+                               side_effect=patch.Refused("Codex process is running")):
+            with mock.patch.object(patch, "read_regular",
+                                   side_effect=AssertionError("must not read a locked service")):
+                snapshot = patch.inspect_status(
+                    self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("running", snapshot.code)
+        self.assertIn("Codex process", snapshot.detail)
+
+    def test_unified_missing_descriptor_keeps_cpp_restore(self):
+        candidate = self.cpp_journal()
+        self.service.write_bytes(candidate)
+        (self.descriptor_dir / ".mcp.json").write_text("{bad", encoding="utf-8")
+        snapshot, selection = gui.inspect(self.home, self.runtime_root, self.state, self.cpp)
+        self.assertIsNone(selection)
+        self.assertEqual("Codex++", snapshot.owner)
+        self.assertTrue(snapshot.can_restore)
+        self.assertFalse(snapshot.can_apply)
+        patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_unified_malformed_descriptor_does_not_mask_running_state(self):
+        self.cpp_state()
+        (self.descriptor_dir / ".mcp.json").write_text("{bad", encoding="utf-8")
+        with mock.patch.object(patch, "require_offline",
+                               side_effect=patch.Refused("Codex process is running")):
+            snapshot, selection = gui.inspect(
+                self.home, self.runtime_root, self.state, self.cpp)
+        self.assertIsNone(selection)
+        self.assertEqual("running", snapshot.code)
+        self.assertIn("descriptor", snapshot.detail)
+
+    def test_unified_missing_control_can_be_restored(self):
+        candidate = self.cpp_journal()
+        self.service.write_bytes(candidate)
+        (self.cpp / "control.json").unlink()
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("disabled", snapshot.code)
+        self.assertTrue(snapshot.can_restore)
+        patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(self.original, self.service.read_bytes())
+
+    def test_unified_restored_standalone_record_then_cpp_owner(self):
+        patch.apply(self.runtime_root, self.state, self.selection)
+        patch.restore(self.runtime_root, self.state)
+        self.cpp_state()
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("Codex++", snapshot.owner)
+        self.assertTrue(snapshot.can_apply)
+        patch.apply_unified(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("patched", patch.inspect_status(
+            self.runtime_root, self.state, self.selection, self.cpp).code)
+
+    def test_unified_cpp_unknown_entry_and_failure_leave_control_unchanged(self):
+        candidate = self.cpp_journal()
+        self.service.write_bytes(candidate)
+        (self.cpp / "unexpected.txt").write_text("foreign", encoding="utf-8")
+        snapshot = patch.inspect_status(self.runtime_root, self.state, self.selection, self.cpp)
+        self.assertEqual("conflict", snapshot.code)
+        self.assertFalse(snapshot.can_restore)
+        with self.assertRaises(patch.Refused):
+            patch.restore_unified(self.runtime_root, self.state, self.cpp)
+        self.assertEqual(candidate, self.service.read_bytes())
+        self.assertTrue(json.loads((self.cpp / "control.json").read_text())
+                        ["requireIdentification"])
 
     def test_status_is_read_only_and_roundtrip_is_idempotent(self):
         patch.status(self.runtime_root, self.state, self.selection)
@@ -421,6 +700,23 @@ class GenuineNativeFixture(unittest.TestCase):
             patch.apply(runtime_root, state, selection)
             self.assertNotEqual(before, (copied / patch.SERVICE).read_bytes())
             patch.restore(runtime_root, state)
+            self.assertEqual(before, (copied / patch.SERVICE).read_bytes())
+            self.assertEqual(before_mtime, (copied / patch.SERVICE).stat().st_mtime_ns)
+            cpp = root / "cpp-state"
+            cpp.mkdir()
+            (cpp / "owner.lock").touch()
+            (cpp / "monitor.lock").write_text(json.dumps({
+                "schema": 1, "generation": "00000000-0000-0000-0000-000000000001",
+                "state": "restored",
+            }), encoding="utf-8")
+            (cpp / "control.json").write_bytes(patch.control_bytes(False))
+            patch.apply_unified(runtime_root, state, selection, cpp)
+            adapted = (copied / patch.SERVICE).read_bytes()
+            self.assertEqual(patch.sha(adapted),
+                             json.loads((cpp / runtime.name / "journal.json").read_text())
+                             ["candidateSha"])
+            self.assertNotEqual(before, adapted)
+            patch.restore_unified(runtime_root, state, cpp)
             self.assertEqual(before, (copied / patch.SERVICE).read_bytes())
             self.assertEqual(before_mtime, (copied / patch.SERVICE).stat().st_mtime_ns)
 
