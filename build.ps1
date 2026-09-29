@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string] $WorkRoot
+    [string] $WorkRoot,
+    [string] $PackageIndex
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,8 +36,13 @@ try {
     python -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
     $python = Join-Path $venv 'Scripts\python.exe'
-    & $python -m pip install --no-cache-dir --disable-pip-version-check --no-input `
-        -r (Join-Path $root 'requirements-build.txt')
+    $pipArgs = @('-m', 'pip', 'install', '--no-cache-dir', '--disable-pip-version-check',
+        '--no-input', '--report', (Join-Path $work 'pip-report.json'))
+    if ($PackageIndex) {
+        $pipArgs += @('--index-url', $PackageIndex)
+    }
+    $pipArgs += @('-r', (Join-Path $root 'requirements-build.txt'))
+    & $python @pipArgs
     if ($LASTEXITCODE -ne 0) { throw 'Isolated PyInstaller installation failed.' }
     & $python -m PyInstaller --noconfirm --clean --onefile --windowed `
         --name CodexBrowserUnlocker `

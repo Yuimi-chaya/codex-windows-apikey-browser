@@ -57,7 +57,7 @@ py -3 -m unittest discover -s tests -v
 
 核心回调与辅助函数提取自 [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 Windows 原生浏览器兼容实现，沿用 GNU AGPL-3.0；详见 [LICENSE](LICENSE)。本仓库与 OpenAI 没有关联或背书。
 
-构建 EXE 需要在单独虚拟环境安装 `requirements-build.txt` 中固定版本的 PyInstaller。`build.ps1 -WorkRoot <独立工作目录>` 把虚拟环境、临时文件和构建缓存放在该目录；不要把工作目录指向源仓库。构建结果在 `<工作目录>\dist\CodexBrowserUnlocker.exe`。构建不安装、关闭或重启 Codex，也不修改活动 CUA 服务。
+构建 EXE 需要在单独虚拟环境安装 `requirements-build.txt` 中固定版本的 PyInstaller。`build.ps1 -WorkRoot <独立工作目录>` 把虚拟环境、临时文件、依赖下载报告和构建缓存放在该目录；可用 `-PackageIndex <镜像地址>` 仅为本次安装指定镜像，不修改全局 pip 配置。不要把工作目录指向源仓库。构建结果在 `<工作目录>\dist\CodexBrowserUnlocker.exe`。构建不安装、关闭或重启 Codex，也不修改活动 CUA 服务。
 
 ## English
 
@@ -89,4 +89,4 @@ Run `py -3 -m unittest discover -s tests -v` for synthetic tests. The optional g
 
 For the optional genuine-byte test, set `CODEX_BROWSER_FIXTURE_RUNTIME` and `CODEX_BROWSER_FIXTURE_DESCRIPTOR`. If the live service is already adapted, set `CODEX_BROWSER_FIXTURE_SERVICE` to a fingerprint-verified original backup; it is read only. `CODEX_BROWSER_TEST_TEMP` can place the temporary copy on a larger drive.
 
-To build from source, install the pinned PyInstaller version in an isolated environment with `build.ps1 -WorkRoot <dedicated-directory>`. The script places its virtual environment, temporary files, and build cache outside the repository and writes `<work-root>\dist\CodexBrowserUnlocker.exe`. It never installs, stops, restarts, or patches a running Codex instance.
+To build from source, install the pinned PyInstaller version in an isolated environment with `build.ps1 -WorkRoot <dedicated-directory>`. An optional `-PackageIndex <mirror-url>` affects only that installation, not global pip configuration. The script places its virtual environment, temporary files, dependency download report, and build cache outside the repository and writes `<work-root>\dist\CodexBrowserUnlocker.exe`. It never installs, stops, restarts, or patches a running Codex instance.
